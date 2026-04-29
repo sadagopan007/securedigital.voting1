@@ -69,8 +69,7 @@ def load_voters():
     return voters
 
 VOTER_DATABASE = load_voters()
-otp_storage    = {}
-login_attempts = {}
+login_attempts = {}  # rate-limiting only, not critical state
 
 CANDIDATES = [
     {"id": "A", "name": "Arun Kumar",   "party": "Progressive Alliance", "symbol": "🌟"},
@@ -80,42 +79,11 @@ CANDIDATES = [
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin@securevote2024")
 
-# ═══════════════════════════════════════════════════════════════════════
-#  FIREBASE DATABASE STRUCTURE (PRIVACY-SAFE)
-# ───────────────────────────────────────────────────────────────────────
-#
-#  votes_cast/
-#    VOTER001/ → { timestamp: "1700000000.0", hash: "ABCD1234" }
-#    VOTER002/ → { timestamp: "1700000001.0", hash: "EF567890" }
-#    ✅ Proves WHO voted — does NOT store who they voted FOR
-#
-#  vote_counts/
-#    A → 5        (raw integer — no voter names attached)
-#    B → 3
-#    C → 2
-#    ✅ Stores only anonymous tally
-#
-#  fraud_log/
-#    -auto_id/ → { type: "double_vote_attempt", voter_id: "V001", time: "..." }
-#
-#  election_meta/
-#    voting_ended → false
-#    trust_score  → 85
-#
-# ═══════════════════════════════════════════════════════════════════════
-
 def db_voter_voted(voter_id):
     return fb_get(f"votes_cast/{voter_id}") is not None
 
 def db_cast_vote(voter_id, timestamp, vote_hash, candidate_id):
-    """
-    SECRET BALLOT: voter identity and candidate choice stored SEPARATELY.
-    No one (not even admin) can look up which candidate a voter chose.
-    """
-    ok1 = fb_set(f"votes_cast/{voter_id}", {
-        "timestamp": str(timestamp),
-        "hash":      vote_hash
-    })
+    ok1 = fb_set(f"votes_cast/{voter_id}", {"timestamp": str(timestamp), "hash": vote_hash})
     current = fb_get(f"vote_counts/{candidate_id}") or 0
     ok2 = fb_set(f"vote_counts/{candidate_id}", current + 1)
     return ok1 and ok2
@@ -183,7 +151,6 @@ def login():
     meta = db_get_meta()
     return render_template("login.html", voting_ended=meta["voting_ended"])
 
-# ── ADMIN AUTH ────────────────────────────────────────────────────────
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     error = None
@@ -200,7 +167,6 @@ def admin_logout():
     session.pop("is_admin", None)
     return redirect(url_for("admin_login"))
 
-# ── ADMIN PANEL ───────────────────────────────────────────────────────
 @app.route("/admin")
 def admin():
     if not session.get("is_admin"):
@@ -269,47 +235,72 @@ def send_otp():
             error="⚠ Too many attempts. Contact election office.", alert=True)
 
     otp = random.randint(100000, 999999)
-    otp_storage[voter_id] = {"otp": otp, "aadhaar": aadhaar, "expires_at": time.time() + 300}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ROOT CAUSE FIX — store OTP in the Flask session COOKIE, not a dict.
+    #
+    # The old code stored OTP in otp_storage = {} — a plain Python dict
+    # that lives in one worker's memory. Gunicorn starts multiple worker
+    # processes. Each worker has its own separate memory space:
+    #
+    #   Worker 1  handles POST /send_otp  → saves OTP in Worker 1's dict
+    #   Worker 2  handles POST /verify_otp → Worker 2's dict is EMPTY
+    #                                      → "Session expired" error
+    #
+    # Storing OTP in session[] puts it in a signed cookie that the browser
+    # sends back on every request — it reaches whichever worker handles it.
+    # ══════════════════════════════════════════════════════════════════════
+    session["pending_voter_id"] = voter_id
+    session["pending_otp"]      = str(otp)
+    session["otp_expires_at"]   = time.time() + 300
+    session["authenticated"]    = False
+    session.modified            = True
+
     login_attempts[voter_id] = attempts + 1
 
-    # ⚠ PRODUCTION: Replace otp_demo with SMS/email delivery. Never show OTP in UI!
+    # ⚠ PRODUCTION: Replace otp_demo with real SMS/email delivery!
     print(f"\n{'='*40}\n  OTP for {voter_id}: {otp}\n{'='*40}\n")
     return render_template("otp.html", voter_id=voter_id, otp_demo=otp)
+
 
 @app.route("/verify_otp", methods=["POST"])
 def verify_otp():
     voter_id    = request.form.get("voter_id", "").strip().upper()
     entered_otp = request.form.get("otp", "").strip()
     meta        = db_get_meta()
-    record      = otp_storage.get(voter_id)
 
-    if not record:
+    # Read OTP from session cookie — works across all Gunicorn workers
+    pending_id = session.get("pending_voter_id", "")
+    stored_otp = session.get("pending_otp", "")
+    expires_at = session.get("otp_expires_at", 0)
+
+    if not stored_otp or pending_id != voter_id:
         return render_template("login.html", voting_ended=meta["voting_ended"],
                                error="Session expired. Please login again.")
 
-    if time.time() > record["expires_at"]:
-        del otp_storage[voter_id]
+    if time.time() > expires_at:
+        session.pop("pending_voter_id", None)
+        session.pop("pending_otp", None)
+        session.pop("otp_expires_at", None)
+        session.modified = True
         return render_template("login.html", voting_ended=meta["voting_ended"],
                                error="OTP expired. Please login again.")
 
-    if str(record["otp"]) != entered_otp:
+    if stored_otp != entered_otp:
         db_log_fraud("wrong_otp", voter_id); db_reduce_trust(5)
         return render_template("otp.html", voter_id=voter_id,
-                               error="Wrong OTP. Try again.", otp_demo=record["otp"])
+                               error="Wrong OTP. Try again.", otp_demo=int(stored_otp))
 
-    # ✅ FIX 1: Delete used OTP immediately — prevent OTP reuse
-    del otp_storage[voter_id]
-
-    # ✅ FIX 2: NEVER use session.clear() before a redirect — Flask writes the
-    #    session cookie on the response object. session.clear() destroys all data
-    #    then the redirect is issued; on some WSGI servers / Secure cookie configs
-    #    the new keys set after clear() are lost, so /vote sees no session and
-    #    bounces the user back to login. Only pop stale keys instead.
+    # ✅ OTP verified — clear OTP keys, grant voter session
+    session.pop("pending_voter_id", None)
+    session.pop("pending_otp", None)
+    session.pop("otp_expires_at", None)
     session.pop("is_admin", None)
     session["voter_id"]      = voter_id
     session["authenticated"] = True
     session.modified         = True
     return redirect(url_for("vote"))
+
 
 @app.route("/vote")
 def vote():
@@ -377,20 +368,21 @@ def api_results():
 def reset():
     if not session.get("is_admin"):
         return redirect(url_for("admin_login"))
-    global login_attempts, otp_storage
+    global login_attempts
     db_reset()
-    otp_storage    = {}
     login_attempts = {}
-    # ✅ FIX 3: Keep is_admin in session so the redirect to /admin succeeds.
-    #    Only clear voter-related keys.
+    # Keep is_admin so the redirect to /admin succeeds
     session.pop("voter_id", None)
     session.pop("authenticated", None)
     session.pop("voted_for", None)
     session.pop("vote_hash", None)
+    session.pop("pending_voter_id", None)
+    session.pop("pending_otp", None)
+    session.pop("otp_expires_at", None)
     session.modified = True
     return redirect(url_for("admin"))
 
-# NOTE: /database route has been REMOVED — it was exposing all Aadhaar numbers publicly!
+# NOTE: /database route REMOVED — it was exposing all Aadhaar numbers publicly!
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
